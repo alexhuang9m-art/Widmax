@@ -1,4 +1,8 @@
-# React + TypeScript + Vite
+# Widmax
+
+Multi-video playback and comparison workspace in the browser (React + TypeScript + Vite). See [`docs/deployment.md`](docs/deployment.md) for static hosting.
+
+This template section below is retained from the Vite starter:
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 

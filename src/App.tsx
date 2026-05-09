@@ -8,6 +8,14 @@ const STORE_NAME = 'videos'
 type CachedVideo = { name: string; file: Blob }
 type AlignStatus = 'idle' | 'running' | 'failed'
 
+const VIDEO_EXT = /\.(mp4|m4v|webm|mkv|mov|avi|mpeg|mpg|wmv|flv|3gp|ts|m2ts|ogv)(\?.*)?$/i
+
+function isVideoFile(file: File) {
+  if (file.type.startsWith('video/')) return true
+  const path = file.webkitRelativePath || file.name
+  return VIDEO_EXT.test(path)
+}
+
 async function openCacheDb() {
   return await new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1)
@@ -294,9 +302,14 @@ function App() {
   const handleFolderImport = (event: ChangeEvent<HTMLInputElement>) => {
     const fileList = Array.from(event.target.files ?? [])
     const source = fileList
-      .filter((file) => file.type.startsWith('video/'))
+      .filter((file) => isVideoFile(file))
       .map((file) => ({ name: file.webkitRelativePath || file.name, file }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+
+    if (source.length === 0) {
+      event.target.value = ''
+      return
+    }
 
     const videos = source.map((item) => ({
       id: crypto.randomUUID(),
