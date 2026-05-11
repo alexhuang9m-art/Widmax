@@ -901,6 +901,9 @@ function App() {
         <section className="playback-row">
           {selectedVideos.map((video) => (
             <article key={video.id} className="play-tile glass">
+              <div className="play-tile-title" title={video.name}>
+                {video.name}
+              </div>
               <div className="video-stage">
                 <video
                   ref={(node) => {
