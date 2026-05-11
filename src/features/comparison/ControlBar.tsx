@@ -1,4 +1,5 @@
 import type { ChangeEvent } from 'react'
+import { widmaxRangeFillStyle } from '../../core/rangeFillStyle'
 import type { LayoutMode, PerformanceProfile } from '../../types/video'
 
 interface ControlBarProps {
@@ -66,11 +67,13 @@ export function ControlBar({
         <label>
           Time
           <input
+            className="widmax-range"
             type="range"
             min={0}
             max={600}
             step={0.01}
             value={masterTime}
+            style={widmaxRangeFillStyle(masterTime, 0, 600)}
             onChange={(event: ChangeEvent<HTMLInputElement>) => onSeek(event.target.valueAsNumber)}
           />
         </label>
