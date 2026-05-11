@@ -1,5 +1,8 @@
 import { createFile, type MP4BoxBuffer } from 'mp4box'
 
+import { formatIso23001ColorDescription } from './colorLabels'
+import { probeBitstreamColorSpace } from './bitstreamColor'
+
 export interface VideoContainerProbe {
   fps: number | null
   codec: string | null
@@ -14,81 +17,6 @@ function readU32BE(u8: Uint8Array, o: number): number {
 
 function fourcc(u8: Uint8Array, o: number): string {
   return String.fromCharCode(u8[o]!, u8[o + 1]!, u8[o + 2]!, u8[o + 3]!)
-}
-
-/** ITU-T H.273 / ISO 23001-8 colour_primaries */
-function primariesLabel(p: number): string {
-  switch (p) {
-    case 1:
-      return 'BT.709'
-    case 4:
-      return 'BT.470M'
-    case 5:
-      return 'BT.470BG'
-    case 6:
-    case 7:
-      return 'SMPTE 170M'
-    case 8:
-      return 'Generic film'
-    case 9:
-      return 'BT.2020 / BT.2100'
-    case 10:
-    case 11:
-      return 'SMPTE ST 428-1'
-    default:
-      return p > 0 ? `未知（primaries=${p}）` : '未知'
-  }
-}
-
-function transferLabel(t: number): string {
-  switch (t) {
-    case 1:
-    case 6:
-      return 'BT.709 / BT.1361'
-    case 4:
-      return 'BT.470M'
-    case 5:
-      return 'BT.470BG'
-    case 7:
-      return 'SMPTE 170M'
-    case 11:
-      return 'IEC 61966-2-4 (sRGB)'
-    case 13:
-      return 'sYCC'
-    case 14:
-    case 15:
-      return 'BT.2020 10/12-bit'
-    case 16:
-      return 'SMPTE ST 2084 (PQ)'
-    case 18:
-      return 'HLG (ARIB STD-B67)'
-    default:
-      return t > 0 ? `未知（transfer=${t}）` : '未知'
-  }
-}
-
-function matrixLabel(m: number): string {
-  switch (m) {
-    case 1:
-      return 'BT.709'
-    case 4:
-      return 'FCC US'
-    case 5:
-    case 6:
-      return 'BT.470BG / BT.601'
-    case 7:
-      return 'SMPTE 170M'
-    case 8:
-      return 'YCgCo'
-    case 9:
-      return 'BT.2020 NCL'
-    case 10:
-      return 'BT.2020 CL'
-    case 14:
-      return 'ICTCP BT.2100'
-    default:
-      return m > 0 ? `未知（matrix=${m}）` : '未知'
-  }
 }
 
 /** ISO/IEC 14496-12 VisualSampleEntry prefix before extension boxes (avc1/hvc1/vp09/…). */
@@ -174,12 +102,7 @@ function parseNclxAfterType(payload: Uint8Array, typeOffset: number): string | n
   const matrix = (payload[data0 + 4]! << 8) | payload[data0 + 5]!
   const fr = (payload[data0 + 6]! << 8) | payload[data0 + 7]!
   const full = (fr & 0x8000) !== 0
-  return [
-    `色域基色 ${primariesLabel(prim)}`,
-    `传递特性 ${transferLabel(transfer)}`,
-    `矩阵系数 ${matrixLabel(matrix)}`,
-    full ? '全范围' : '有限范围',
-  ].join(' · ')
+  return formatIso23001ColorDescription(prim, transfer, matrix, full)
 }
 
 /** Parse ColourInformationBox at `o` (box start), size includes header. */
@@ -332,7 +255,7 @@ export async function probeVideoContainer(blob: Blob): Promise<VideoContainerPro
     return null
   }
 
-  const colorSpace = probeNclxColorSpace(buffer)
+  const colorSpace = probeNclxColorSpace(buffer) ?? probeBitstreamColorSpace(buffer)
 
   return new Promise((resolve) => {
     const mp4file = createFile()
