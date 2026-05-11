@@ -122,6 +122,41 @@ body {
   gap: 8px;
 }
 
+.sidebar-import-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.import-progress-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.import-progress-track {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: #1a1a1a;
+  overflow: hidden;
+}
+
+.import-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--widmax-primary);
+  transition: width 0.12s ease-out;
+}
+
+.import-progress-label {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+}
+
 .mini-btn {
   border: 1px solid #4a4a4a;
   background: #2d2d30;
@@ -329,13 +364,62 @@ body {
   min-height: 0;
 }
 
+.video-slot-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+  background: rgba(30, 30, 30, 0.82);
+  border: none;
+  outline: none;
+}
+
+.video-slot-loading--error {
+  background: rgba(26, 26, 26, 0.88);
+}
+
+.video-slot-loading-text {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.video-slot-loading-track {
+  width: min(200px, 72%);
+  height: 3px;
+  border-radius: 2px;
+  background: var(--widmax-on-primary);
+  overflow: hidden;
+}
+
+.video-slot-loading-bar {
+  height: 100%;
+  width: 42%;
+  border-radius: 2px;
+  background: var(--widmax-primary);
+  animation: video-slot-load-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes video-slot-load-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
 .video-info-overlay {
   position: absolute;
   top: 0;
   left: 0;
   z-index: 4;
   margin: 8px;
-  max-width: min(280px, 92%);
+  max-width: min(360px, 94%);
   padding: 8px 10px;
   pointer-events: none;
   background: rgba(12, 12, 12, 0.78);
@@ -380,6 +464,8 @@ body {
   margin: 0;
   text-align: right;
   color: rgba(255, 255, 255, 0.9);
+  word-break: break-word;
+  white-space: normal;
 }
 
 video {
@@ -407,9 +493,9 @@ video {
   gap: 4px 10px;
   align-items: center;
   padding: 5px 10px 6px;
-  background: linear-gradient(180deg, #323232 0%, #1c1c1c 100%);
-  border-top: 1px solid #000;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  background: #1e1e1e;
+  border-top: 1px solid #3c3c3c;
+  box-shadow: none;
 }
 
 .tile-controls .tile-transport {

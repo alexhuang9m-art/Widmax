@@ -20,6 +20,11 @@ import {
   upsertManualAlignCacheEntry,
   type ManualAlignCacheEntry,
 } from './core/manual-align-cache'
+import {
+  measureFpsViaRequestVideoFrameCallback,
+  probeVideoContainer,
+  type VideoContainerProbe,
+} from './core/video/containerProbe'
 import { widmaxRangeFillStyle } from './core/rangeFillStyle'
 import { AudioWaveformStrip } from './features/waveform/AudioWaveformStrip'
 import { SettingsDialog } from './features/settings/SettingsDialog'
@@ -49,22 +54,18 @@ interface VideoDiagnostics {
   width: number
   height: number
   durationSec: number
-  fps: number | null
   bitrateMbps: number | null
   fileSizeMB: number | null
 }
+
+type MediaProbeHud =
+  | 'pending'
+  | (VideoContainerProbe & { fpsSource?: 'container' | 'rvfc' })
 
 function collectVideoDiagnostics(video: HTMLVideoElement, source: VideoSource): VideoDiagnostics {
   const width = video.videoWidth
   const height = video.videoHeight
   const durationSec = Number.isFinite(video.duration) ? video.duration : 0
-  let fps: number | null = null
-  const q = video.getVideoPlaybackQuality?.()
-  if (q && video.currentTime > 0.25) {
-    const frames = q.totalVideoFrames - q.droppedVideoFrames
-    const est = frames / video.currentTime
-    if (Number.isFinite(est) && est >= 1 && est <= 240) fps = est
-  }
   let bitrateMbps: number | null = null
   let fileSizeMB: number | null = null
   if (source.blob && durationSec > 0) {
@@ -76,7 +77,6 @@ function collectVideoDiagnostics(video: HTMLVideoElement, source: VideoSource): 
     width,
     height,
     durationSec,
-    fps,
     bitrateMbps,
     fileSizeMB,
   }
@@ -104,12 +104,59 @@ function PauseGlyph({ className }: { className?: string }) {
   )
 }
 
-function VideoInfoHud({ video, diag }: { video: VideoSource; diag: VideoDiagnostics | undefined }) {
+function VideoInfoHud({
+  video,
+  diag,
+  mediaProbe,
+}: {
+  video: VideoSource
+  diag: VideoDiagnostics | undefined
+  mediaProbe: MediaProbeHud | undefined
+}) {
   const res =
     diag && diag.width > 0 && diag.height > 0 ? `${diag.width}×${diag.height}` : '—'
   const dur = diag && diag.durationSec > 0 ? formatQuickTimeDuration(diag.durationSec) : '—'
-  const fps =
-    diag?.fps != null && Number.isFinite(diag.fps) ? `${diag.fps.toFixed(1)} fps` : '—'
+
+  let fps = '—'
+  let fpsTitle = '来自容器（MP4/MOV）或播放中的帧间隔统计'
+  if (mediaProbe === 'pending') {
+    fps = '读取中…'
+    fpsTitle = '正在解析媒体'
+  } else if (mediaProbe && mediaProbe.fps != null && Number.isFinite(mediaProbe.fps)) {
+    const src =
+      mediaProbe.fpsSource === 'rvfc'
+        ? '播放帧间隔（容器无帧率或无法解析）'
+        : '容器轨道（nb_samples ÷ 时长）'
+    fpsTitle = src
+    const rounded =
+      Math.abs(mediaProbe.fps - Math.round(mediaProbe.fps)) < 0.02
+        ? String(Math.round(mediaProbe.fps))
+        : mediaProbe.fps.toFixed(3).replace(/\.?0+$/, '')
+    fps = `${rounded} fps`
+  }
+
+  const codec =
+    mediaProbe && mediaProbe !== 'pending' && mediaProbe.codec
+      ? mediaProbe.codec
+      : mediaProbe === 'pending'
+        ? '读取中…'
+        : '—'
+  const codecTitle =
+    mediaProbe && mediaProbe !== 'pending' && mediaProbe.codec
+      ? 'MIME codecs 参数（与 MSE SourceBuffer 一致）'
+      : undefined
+
+  const color =
+    mediaProbe && mediaProbe !== 'pending' && mediaProbe.colorSpace
+      ? mediaProbe.colorSpace
+      : mediaProbe === 'pending'
+        ? '读取中…'
+        : '—'
+  const colorTitle =
+    mediaProbe && mediaProbe !== 'pending' && mediaProbe.colorSpace
+      ? '来自 colr/nclx 或容器解析'
+      : undefined
+
   const br =
     diag?.bitrateMbps != null && Number.isFinite(diag.bitrateMbps)
       ? `${diag.bitrateMbps.toFixed(2)} Mb/s（均）`
@@ -129,7 +176,11 @@ function VideoInfoHud({ video, diag }: { video: VideoSource; diag: VideoDiagnost
         <dt>时长</dt>
         <dd>{dur}</dd>
         <dt>帧率</dt>
-        <dd title="基于已解码帧与当前播放时间估算">{fps}</dd>
+        <dd title={fpsTitle}>{fps}</dd>
+        <dt>色域</dt>
+        <dd title={colorTitle}>{color}</dd>
+        <dt>解码器</dt>
+        <dd title={codecTitle}>{codec}</dd>
         <dt>码率</dt>
         <dd title="文件大小÷时长，容器级平均码率">{br}</dd>
         <dt>体积</dt>
@@ -174,20 +225,48 @@ async function readCachedVideos(): Promise<VideoSource[]> {
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
 }
 
-async function writeCachedVideos(videos: { name: string; file: File }[]) {
+const CACHE_WRITE_BATCH = 24
+
+/** Clear store then batch-put with progress 0–1 (for UI). */
+async function writeCachedVideosWithProgress(
+  videos: { name: string; file: File }[],
+  onProgress: (ratio: number) => void,
+): Promise<void> {
+  if (videos.length === 0) {
+    onProgress(1)
+    return
+  }
   const db = await openCacheDb()
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite')
     const store = tx.objectStore(STORE_NAME)
     store.clear()
-    videos.forEach((video) => {
-      store.put({ name: video.name, file: video.file })
-    })
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+  let written = 0
+  const total = videos.length
+  for (let i = 0; i < videos.length; i += CACHE_WRITE_BATCH) {
+    const slice = videos.slice(i, i + CACHE_WRITE_BATCH)
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      slice.forEach((video) => {
+        store.put({ name: video.name, file: video.file })
+      })
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+    written += slice.length
+    onProgress(written / total)
+    await new Promise<void>((r) => {
+      queueMicrotask(r)
+    })
+  }
   db.close()
 }
+
+type VideoSlotLoadState = 'loading' | 'ready' | 'error'
 
 function App() {
   const [library, setLibrary] = useState<VideoSource[]>([])
@@ -211,8 +290,15 @@ function App() {
   const [showVideoInfoOverlay, setShowVideoInfoOverlay] = useState(false)
   const showVideoInfoOverlayRef = useRef(false)
   const [videoDiagnostics, setVideoDiagnostics] = useState<Record<string, VideoDiagnostics>>({})
+  const [mediaProbeById, setMediaProbeById] = useState<Record<string, MediaProbeHud | undefined>>({})
+  const mediaProbeCacheRef = useRef(
+    new Map<string, VideoContainerProbe | null>(),
+  )
   const [waveformPeaks, setWaveformPeaks] = useState<Record<string, number[]>>({})
   const [waveformRefreshKey, setWaveformRefreshKey] = useState(0)
+  const [importProgress, setImportProgress] = useState<number | null>(null)
+  const [videoSlotLoadState, setVideoSlotLoadState] = useState<Record<string, VideoSlotLoadState>>({})
+  const prevSelectedIdsRef = useRef<Set<string>>(new Set())
   const waveformDecodeDurRef = useRef<Record<string, number>>({})
   const waveformDecodeGenRef = useRef<Record<string, number>>({})
   const waveformInflightRef = useRef(new Set<string>())
@@ -223,6 +309,31 @@ function App() {
     videoProgressRef.current = videoProgress
     masterTimeRef.current = masterTime
   }, [videoProgress, masterTime])
+
+  useEffect(() => {
+    const prev = prevSelectedIdsRef.current
+    const curr = new Set(selectedIds)
+    setVideoSlotLoadState((map) => {
+      const next = { ...map }
+      for (const id of selectedIds) {
+        if (!prev.has(id)) {
+          const el = videoRefs.current.get(id)
+          const metaReady =
+            el != null &&
+            Number.isFinite(el.duration) &&
+            el.duration > 0 &&
+            el.readyState >= 1
+          if (next[id] === 'ready' || next[id] === 'error') continue
+          next[id] = metaReady ? 'ready' : 'loading'
+        }
+      }
+      for (const id of prev) {
+        if (!curr.has(id)) delete next[id]
+      }
+      return next
+    })
+    prevSelectedIdsRef.current = new Set(selectedIds)
+  }, [selectedIds])
 
   useEffect(() => {
     showVideoInfoOverlayRef.current = showVideoInfoOverlay
@@ -751,24 +862,132 @@ function App() {
     return () => window.clearInterval(id)
   }, [showVideoInfoOverlay, selectedVideos])
 
+  useEffect(() => {
+    let cancelled = false
+
+    const clearRaf = requestAnimationFrame(() => {
+      if (cancelled) return
+      if (!showVideoInfoOverlay) {
+        setMediaProbeById({})
+        return
+      }
+
+      setMediaProbeById(() => {
+        const init: Record<string, MediaProbeHud | undefined> = {}
+        for (const v of selectedVideos) init[v.id] = 'pending'
+        return init
+      })
+
+      const cache = mediaProbeCacheRef.current
+      for (const v of selectedVideos) {
+        void (async () => {
+          const id = v.id
+          let base: VideoContainerProbe = { fps: null, codec: null, colorSpace: null }
+          try {
+            if (v.blob) {
+              const key = fileSignature(v)
+              const hit = cache.get(key)
+              if (hit !== undefined) {
+                base = {
+                  fps: hit?.fps ?? null,
+                  codec: hit?.codec ?? null,
+                  colorSpace: hit?.colorSpace ?? null,
+                }
+              } else {
+                const probed = await probeVideoContainer(v.blob)
+                cache.set(key, probed)
+                base = probed ?? { fps: null, codec: null, colorSpace: null }
+              }
+            }
+
+            if (base.fps == null) {
+              const el = videoRefs.current.get(id)
+              if (el && !el.paused) {
+                const f = await measureFpsViaRequestVideoFrameCallback(el)
+                if (f != null) {
+                  if (cancelled) return
+                  setMediaProbeById((prev) => ({
+                    ...prev,
+                    [id]: { ...base, fps: f, fpsSource: 'rvfc' },
+                  }))
+                  return
+                }
+              }
+            }
+
+            if (cancelled) return
+            setMediaProbeById((prev) => ({
+              ...prev,
+              [id]: {
+                ...base,
+                ...(base.fps != null ? { fpsSource: 'container' as const } : {}),
+              },
+            }))
+          } catch {
+            if (cancelled) return
+            setMediaProbeById((prev) => ({
+              ...prev,
+              [id]: { fps: null, codec: null, colorSpace: null },
+            }))
+          }
+        })()
+      }
+    })
+
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(clearRaf)
+    }
+  }, [showVideoInfoOverlay, selectedVideos])
+
   const handleFolderImport = (event: ChangeEvent<HTMLInputElement>) => {
-    const fileList = Array.from(event.target.files ?? [])
+    const input = event.currentTarget
+    const fileList = Array.from(input.files ?? [])
     const source = fileList
       .filter((file) => file.type.startsWith('video/'))
       .map((file) => ({ name: file.webkitRelativePath || file.name, file }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
 
-    const videos = source.map((item) => ({
-      id: crypto.randomUUID(),
-      name: item.name,
-      url: URL.createObjectURL(item.file),
-      type: 'local' as const,
-      blob: item.file,
-    }))
-    setLibrary(videos)
-    setSelectedIds([])
-    void writeCachedVideos(source)
-    event.target.value = ''
+    const run = async () => {
+      if (source.length === 0) {
+        input.value = ''
+        return
+      }
+      setImportProgress(0)
+      try {
+        const videos: VideoSource[] = []
+        const urlChunk = 12
+        for (let i = 0; i < source.length; i += urlChunk) {
+          const end = Math.min(i + urlChunk, source.length)
+          for (let j = i; j < end; j += 1) {
+            const item = source[j]
+            videos.push({
+              id: crypto.randomUUID(),
+              name: item.name,
+              url: URL.createObjectURL(item.file),
+              type: 'local',
+              blob: item.file,
+            })
+          }
+          setImportProgress(end / source.length * 0.42)
+          await new Promise<void>((r) => {
+            requestAnimationFrame(() => r())
+          })
+        }
+        setLibrary(videos)
+        setSelectedIds([])
+        mediaProbeCacheRef.current.clear()
+        await writeCachedVideosWithProgress(source, (p) => {
+          setImportProgress(0.42 + p * 0.58)
+        })
+      } catch {
+        /* IndexedDB or decode failures — library may still be updated */
+      } finally {
+        setImportProgress(null)
+        input.value = ''
+      }
+    }
+    void run()
   }
 
   const toggleSelection = (id: string) => {
@@ -851,25 +1070,38 @@ function App() {
         </div>
         <aside className={`sidebar glass ${sidebarCollapsed ? 'hidden' : ''}`}>
           <div className="sidebar-actions">
-            <label className="import-label widmax-btn-primary widmax-btn-split">
-              <span className="widmax-btn-split-main">
-                <span className="widmax-btn-split-icon" aria-hidden>
-                  ✓
+            <div className="sidebar-import-block">
+              <label className="import-label widmax-btn-primary widmax-btn-split">
+                <span className="widmax-btn-split-main">
+                  <span className="widmax-btn-split-icon" aria-hidden>
+                    ✓
+                  </span>
+                  Import Folder
                 </span>
-                Import Folder
-              </span>
-              <span className="widmax-btn-split-sep" aria-hidden />
-              <span className="widmax-btn-split-chevron" aria-hidden>
-                ∨
-              </span>
-              <input
-                type="file"
-                multiple
-                webkitdirectory=""
-                directory=""
-                onChange={handleFolderImport}
-              />
-            </label>
+                <span className="widmax-btn-split-sep" aria-hidden />
+                <span className="widmax-btn-split-chevron" aria-hidden>
+                  ∨
+                </span>
+                <input
+                  type="file"
+                  multiple
+                  webkitdirectory=""
+                  directory=""
+                  onChange={handleFolderImport}
+                />
+              </label>
+              {importProgress != null ? (
+                <div className="import-progress-block" aria-live="polite">
+                  <div className="import-progress-track">
+                    <div
+                      className="import-progress-fill"
+                      style={{ width: `${Math.round(importProgress * 100)}%` }}
+                    />
+                  </div>
+                  <div className="import-progress-label">导入中…</div>
+                </div>
+              ) : null}
+            </div>
           </div>
           <div className="video-list">
             {library.length === 0 ? <p className="muted">导入文件夹后在此选择视频</p> : null}
@@ -922,6 +1154,7 @@ function App() {
                     const currentTime = event.currentTarget.currentTime
                     const nativeDuration = event.currentTarget.duration
                     const el = event.currentTarget
+                    setVideoSlotLoadState((prev) => ({ ...prev, [video.id]: 'ready' }))
                     setVideoDiagnostics((prev) => ({
                       ...prev,
                       [video.id]: collectVideoDiagnostics(el, video),
@@ -948,9 +1181,34 @@ function App() {
                   }}
                   onPlay={() => setVideoPlaying((prev) => ({ ...prev, [video.id]: true }))}
                   onPause={() => setVideoPlaying((prev) => ({ ...prev, [video.id]: false }))}
+                  onError={() => {
+                    setVideoSlotLoadState((prev) => ({ ...prev, [video.id]: 'error' }))
+                  }}
                 />
+                {videoSlotLoadState[video.id] !== 'ready' ? (
+                  <div
+                    className={`video-slot-loading ${videoSlotLoadState[video.id] === 'error' ? 'video-slot-loading--error' : ''}`}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {videoSlotLoadState[video.id] === 'error' ? (
+                      <span className="video-slot-loading-text">无法加载视频</span>
+                    ) : (
+                      <>
+                        <span className="video-slot-loading-text">加载中…</span>
+                        <div className="video-slot-loading-track">
+                          <div className="video-slot-loading-bar" />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : null}
                 {showVideoInfoOverlay ? (
-                  <VideoInfoHud video={video} diag={videoDiagnostics[video.id]} />
+                  <VideoInfoHud
+                    video={video}
+                    diag={videoDiagnostics[video.id]}
+                    mediaProbe={mediaProbeById[video.id]}
+                  />
                 ) : null}
               </div>
               <div className="tile-controls">
