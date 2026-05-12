@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "hls.js": "^1.6.16",
-    "mp4box": "^2.3.0",
+    "mediainfo.js": "^0.3.7",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "zustand": "^5.0.13"

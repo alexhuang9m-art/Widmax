@@ -20,11 +20,12 @@ import {
   upsertManualAlignCacheEntry,
   type ManualAlignCacheEntry,
 } from './core/manual-align-cache'
+import { measureFpsViaRequestVideoFrameCallback } from './core/video/rvfcFps'
 import {
-  measureFpsViaRequestVideoFrameCallback,
-  probeVideoContainer,
-  type VideoContainerProbe,
-} from './core/video/containerProbe'
+  readVideoMetadataWasm,
+  withRvfcFps,
+  type VideoWasmMetadata,
+} from './core/video/wasmVideoMetadata'
 import { widmaxRangeFillStyle } from './core/rangeFillStyle'
 import { AudioWaveformStrip } from './features/waveform/AudioWaveformStrip'
 import { SettingsDialog } from './features/settings/SettingsDialog'
@@ -49,38 +50,7 @@ function formatQuickTimeDuration(seconds: number): string {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-interface VideoDiagnostics {
-  name: string
-  width: number
-  height: number
-  durationSec: number
-  bitrateMbps: number | null
-  fileSizeMB: number | null
-}
-
-type MediaProbeHud =
-  | 'pending'
-  | (VideoContainerProbe & { fpsSource?: 'container' | 'rvfc' })
-
-function collectVideoDiagnostics(video: HTMLVideoElement, source: VideoSource): VideoDiagnostics {
-  const width = video.videoWidth
-  const height = video.videoHeight
-  const durationSec = Number.isFinite(video.duration) ? video.duration : 0
-  let bitrateMbps: number | null = null
-  let fileSizeMB: number | null = null
-  if (source.blob && durationSec > 0) {
-    fileSizeMB = source.blob.size / (1024 * 1024)
-    bitrateMbps = (source.blob.size * 8) / durationSec / 1_000_000
-  }
-  return {
-    name: source.name,
-    width,
-    height,
-    durationSec,
-    bitrateMbps,
-    fileSizeMB,
-  }
-}
+type VideoWasmHud = 'pending' | VideoWasmMetadata | null
 
 function isTabToggleBlocked(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null
@@ -104,87 +74,73 @@ function PauseGlyph({ className }: { className?: string }) {
   )
 }
 
-function VideoInfoHud({
-  video,
-  diag,
-  mediaProbe,
-}: {
-  video: VideoSource
-  diag: VideoDiagnostics | undefined
-  mediaProbe: MediaProbeHud | undefined
-}) {
-  const res =
-    diag && diag.width > 0 && diag.height > 0 ? `${diag.width}×${diag.height}` : '—'
-  const dur = diag && diag.durationSec > 0 ? formatQuickTimeDuration(diag.durationSec) : '—'
+function VideoInfoHud({ video, wasmMeta }: { video: VideoSource; wasmMeta: VideoWasmHud | undefined }) {
+  const pending = wasmMeta === 'pending'
+  const row = wasmMeta && wasmMeta !== 'pending' ? wasmMeta : null
 
-  let fps = '—'
-  let fpsTitle = '来自容器（MP4/MOV）或播放中的帧间隔统计'
-  if (mediaProbe === 'pending') {
-    fps = '读取中…'
-    fpsTitle = '正在解析媒体'
-  } else if (mediaProbe && mediaProbe.fps != null && Number.isFinite(mediaProbe.fps)) {
-    const src =
-      mediaProbe.fpsSource === 'rvfc'
-        ? '播放帧间隔（容器无帧率或无法解析）'
-        : '容器轨道（nb_samples ÷ 时长）'
-    fpsTitle = src
+  const fileSize = pending ? '读取中…' : row?.fileSizeMb ?? '—'
+  const duration =
+    pending ? '读取中…' : row?.durationSec != null && row.durationSec > 0
+      ? formatQuickTimeDuration(row.durationSec)
+      : '—'
+  const totalBr = pending ? '读取中…' : row?.totalBitrateMbps ?? '—'
+
+  const codec = pending ? '读取中…' : row?.codec ?? '—'
+  const mode = row?.frameRateMode ?? '—'
+  let fpsLine = '—'
+  let fpsTitle = 'MediaInfo（WebAssembly）解析；无数据时可用播放帧间隔回退'
+  if (pending) {
+    fpsLine = '读取中…'
+  } else if (row?.frameRateHz != null && Number.isFinite(row.frameRateHz)) {
+    const f = row.frameRateHz
     const rounded =
-      Math.abs(mediaProbe.fps - Math.round(mediaProbe.fps)) < 0.02
-        ? String(Math.round(mediaProbe.fps))
-        : mediaProbe.fps.toFixed(3).replace(/\.?0+$/, '')
-    fps = `${rounded} fps`
+      Math.abs(f - Math.round(f)) < 0.02 ? String(Math.round(f)) : f.toFixed(3).replace(/\.?0+$/, '')
+    fpsLine = `${rounded} fps（${mode}）`
+    fpsTitle =
+      row.fpsSource === 'rvfc'
+        ? '播放帧间隔统计（WASM 未给出帧率或视频未标恒定帧率）'
+        : 'MediaInfoLib（WASM）'
   }
 
-  const codec =
-    mediaProbe && mediaProbe !== 'pending' && mediaProbe.codec
-      ? mediaProbe.codec
-      : mediaProbe === 'pending'
-        ? '读取中…'
-        : '—'
-  const codecTitle =
-    mediaProbe && mediaProbe !== 'pending' && mediaProbe.codec
-      ? 'MIME codecs 参数（与 MSE SourceBuffer 一致）'
-      : undefined
+  const resolution = pending ? '读取中…' : row?.resolution ?? '—'
+  const chroma = pending ? '读取中…' : row?.chromaSubsampling ?? '—'
+  const bitDepth = pending ? '读取中…' : row?.bitDepth ?? '—'
 
-  const color =
-    mediaProbe && mediaProbe !== 'pending' && mediaProbe.colorSpace
-      ? mediaProbe.colorSpace
-      : mediaProbe === 'pending'
-        ? '读取中…'
-        : '—'
-  const colorTitle =
-    mediaProbe && mediaProbe !== 'pending' && mediaProbe.colorSpace
-      ? '来自 colr/nclx 或容器解析'
-      : undefined
+  const primaries = pending ? '读取中…' : row?.colorPrimaries ?? '—'
+  const transfer = pending ? '读取中…' : row?.transferCharacteristics ?? '—'
+  const matrix = pending ? '读取中…' : row?.matrixCoefficients ?? '—'
+  const colourRange = pending ? '读取中…' : row?.colorRange ?? '—'
 
-  const br =
-    diag?.bitrateMbps != null && Number.isFinite(diag.bitrateMbps)
-      ? `${diag.bitrateMbps.toFixed(2)} Mb/s（均）`
-      : '—'
-  const sz =
-    diag?.fileSizeMB != null && Number.isFinite(diag.fileSizeMB)
-      ? `${diag.fileSizeMB.toFixed(1)} MB`
-      : '—'
   return (
-    <div className="video-info-overlay" role="status" aria-label="视频媒体信息">
+    <div className="video-info-overlay" role="status" aria-label="视频媒体信息（WebAssembly）">
       <div className="video-info-title" title={video.name}>
         {video.name}
       </div>
       <dl className="video-info-dl">
-        <dt>分辨率</dt>
-        <dd>{res}</dd>
+        <dt>文件体积</dt>
+        <dd title="本地 Blob 字节数">{fileSize}</dd>
         <dt>时长</dt>
-        <dd>{dur}</dd>
+        <dd>{duration}</dd>
+        <dt>总码率</dt>
+        <dd title="容器 OverallBitRate，缺省按 体积÷时长 估算">{totalBr}</dd>
+        <dt>编码器</dt>
+        <dd title="Format / Profile / Level（MediaInfo）">{codec}</dd>
         <dt>帧率</dt>
-        <dd title={fpsTitle}>{fps}</dd>
-        <dt>色域</dt>
-        <dd title={colorTitle}>{color}</dd>
-        <dt>解码器</dt>
-        <dd title={codecTitle}>{codec}</dd>
-        <dt>码率</dt>
-        <dd title="文件大小÷时长，容器级平均码率">{br}</dd>
-        <dt>体积</dt>
-        <dd>{sz}</dd>
+        <dd title={fpsTitle}>{fpsLine}</dd>
+        <dt>分辨率</dt>
+        <dd>{resolution}</dd>
+        <dt>视频采样</dt>
+        <dd title="色度子采样">{chroma}</dd>
+        <dt>位深</dt>
+        <dd>{bitDepth}</dd>
+        <dt>色域（基色）</dt>
+        <dd>{primaries}</dd>
+        <dt>传输特性</dt>
+        <dd>{transfer}</dd>
+        <dt>色彩矩阵</dt>
+        <dd>{matrix}</dd>
+        <dt>色彩范围</dt>
+        <dd title="colour_range（Limited / Full 等）">{colourRange}</dd>
       </dl>
     </div>
   )
@@ -289,11 +245,8 @@ function App() {
   const showSettingsRef = useRef(false)
   const [showVideoInfoOverlay, setShowVideoInfoOverlay] = useState(false)
   const showVideoInfoOverlayRef = useRef(false)
-  const [videoDiagnostics, setVideoDiagnostics] = useState<Record<string, VideoDiagnostics>>({})
-  const [mediaProbeById, setMediaProbeById] = useState<Record<string, MediaProbeHud | undefined>>({})
-  const mediaProbeCacheRef = useRef(
-    new Map<string, VideoContainerProbe | null>(),
-  )
+  const [videoWasmMetaById, setVideoWasmMetaById] = useState<Record<string, VideoWasmHud | undefined>>({})
+  const wasmMetaCacheRef = useRef(new Map<string, VideoWasmMetadata | null>())
   const [waveformPeaks, setWaveformPeaks] = useState<Record<string, number[]>>({})
   const [waveformRefreshKey, setWaveformRefreshKey] = useState(0)
   const [importProgress, setImportProgress] = useState<number | null>(null)
@@ -846,89 +799,60 @@ function App() {
   }, [selectedVideos, waveformRefreshKey])
 
   useEffect(() => {
-    if (!showVideoInfoOverlay) return
-    const refresh = () => {
-      setVideoDiagnostics((prev) => {
-        const next = { ...prev }
-        for (const v of selectedVideos) {
-          const el = videoRefs.current.get(v.id)
-          if (el) next[v.id] = collectVideoDiagnostics(el, v)
-        }
-        return next
-      })
-    }
-    refresh()
-    const id = window.setInterval(refresh, 400)
-    return () => window.clearInterval(id)
-  }, [showVideoInfoOverlay, selectedVideos])
-
-  useEffect(() => {
     let cancelled = false
 
     const clearRaf = requestAnimationFrame(() => {
       if (cancelled) return
       if (!showVideoInfoOverlay) {
-        setMediaProbeById({})
+        setVideoWasmMetaById({})
         return
       }
 
-      setMediaProbeById(() => {
-        const init: Record<string, MediaProbeHud | undefined> = {}
+      setVideoWasmMetaById(() => {
+        const init: Record<string, VideoWasmHud | undefined> = {}
         for (const v of selectedVideos) init[v.id] = 'pending'
         return init
       })
 
-      const cache = mediaProbeCacheRef.current
+      const cache = wasmMetaCacheRef.current
       for (const v of selectedVideos) {
         void (async () => {
           const id = v.id
-          let base: VideoContainerProbe = { fps: null, codec: null, colorSpace: null }
           try {
-            if (v.blob) {
-              const key = fileSignature(v)
-              const hit = cache.get(key)
-              if (hit !== undefined) {
-                base = {
-                  fps: hit?.fps ?? null,
-                  codec: hit?.codec ?? null,
-                  colorSpace: hit?.colorSpace ?? null,
-                }
-              } else {
-                const probed = await probeVideoContainer(v.blob)
-                cache.set(key, probed)
-                base = probed ?? { fps: null, codec: null, colorSpace: null }
-              }
+            if (!v.blob) {
+              if (cancelled) return
+              setVideoWasmMetaById((prev) => ({ ...prev, [id]: null }))
+              return
             }
-
-            if (base.fps == null) {
+            const key = fileSignature(v)
+            let row = cache.get(key)
+            if (row === undefined) {
+              row = await readVideoMetadataWasm(v.blob)
+              cache.set(key, row)
+            }
+            if (cancelled) return
+            if (!row) {
+              setVideoWasmMetaById((prev) => ({ ...prev, [id]: null }))
+              return
+            }
+            if (row.frameRateHz == null) {
               const el = videoRefs.current.get(id)
               if (el && !el.paused) {
                 const f = await measureFpsViaRequestVideoFrameCallback(el)
                 if (f != null) {
                   if (cancelled) return
-                  setMediaProbeById((prev) => ({
+                  setVideoWasmMetaById((prev) => ({
                     ...prev,
-                    [id]: { ...base, fps: f, fpsSource: 'rvfc' },
+                    [id]: withRvfcFps(row!, f),
                   }))
                   return
                 }
               }
             }
-
-            if (cancelled) return
-            setMediaProbeById((prev) => ({
-              ...prev,
-              [id]: {
-                ...base,
-                ...(base.fps != null ? { fpsSource: 'container' as const } : {}),
-              },
-            }))
+            setVideoWasmMetaById((prev) => ({ ...prev, [id]: row! }))
           } catch {
             if (cancelled) return
-            setMediaProbeById((prev) => ({
-              ...prev,
-              [id]: { fps: null, codec: null, colorSpace: null },
-            }))
+            setVideoWasmMetaById((prev) => ({ ...prev, [id]: null }))
           }
         })()
       }
@@ -976,7 +900,7 @@ function App() {
         }
         setLibrary(videos)
         setSelectedIds([])
-        mediaProbeCacheRef.current.clear()
+        wasmMetaCacheRef.current.clear()
         await writeCachedVideosWithProgress(source, (p) => {
           setImportProgress(0.42 + p * 0.58)
         })
@@ -1153,12 +1077,7 @@ function App() {
                   onLoadedMetadata={(event) => {
                     const currentTime = event.currentTarget.currentTime
                     const nativeDuration = event.currentTarget.duration
-                    const el = event.currentTarget
                     setVideoSlotLoadState((prev) => ({ ...prev, [video.id]: 'ready' }))
-                    setVideoDiagnostics((prev) => ({
-                      ...prev,
-                      [video.id]: collectVideoDiagnostics(el, video),
-                    }))
                     setVideoProgress((prev) => ({
                       ...prev,
                       [video.id]: {
@@ -1204,11 +1123,7 @@ function App() {
                   </div>
                 ) : null}
                 {showVideoInfoOverlay ? (
-                  <VideoInfoHud
-                    video={video}
-                    diag={videoDiagnostics[video.id]}
-                    mediaProbe={mediaProbeById[video.id]}
-                  />
+                  <VideoInfoHud video={video} wasmMeta={videoWasmMetaById[video.id]} />
                 ) : null}
               </div>
               <div className="tile-controls">
